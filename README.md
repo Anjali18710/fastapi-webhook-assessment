@@ -30,3 +30,38 @@ pytest -v -s
 ## Constraints
 - **No external infrastructure:** Keep the solution self-contained using Python and SQLite (do not add Redis, Celery, RabbitMQ, or PostgreSQL).
 - Complete `DECISIONS.md` explaining your root-cause diagnosis and architectural choices.
+
+---
+
+## Solution Overview
+
+See **[DECISIONS.md](DECISIONS.md)** for the full root-cause analysis and trade-offs.
+
+```
+POST /webhooks/ingest
+  ├─ validate + regex PII scrub (cheap, inline: raw PII never hits disk)
+  ├─ INSERT ... ON CONFLICT(idempotency_key) DO NOTHING RETURNING id   ← atomic idempotency
+  └─ 202 Accepted   (200 = duplicate, 409 = key reused with a different payload)
+          │
+          ▼  (SQLite `events` table = durable outbox)
+  delivery workers (16 async tasks, shared httpx client)
+  ├─ fingerprint in ProcessPoolExecutor (spawned, low CPU priority)
+  ├─ POST downstream with Idempotency-Key header
+  └─ delivered | retry with exponential backoff + jitter | dead after 15 attempts
+  sweeper: re-claims due retries, expired leases and rows left behind by a crash
+```
+
+| File | Responsibility |
+|---|---|
+| `app/main.py` | FastAPI app, lifespan wiring, ingest + health endpoints |
+| `app/database.py` | SQLite schema (WAL), atomic idempotent insert, lease-based claiming |
+| `app/worker.py` | Delivery workers, sweeper, retry/backoff, process pool |
+| `app/downstream.py` | Shared HTTP client, retryable vs permanent error classification |
+| `app/processor.py` | PII scrub and CPU-heavy fingerprint (split so they can run in different places) |
+| `tests/test_reliability.py` | Extra tests: cross-connection races, 409 conflicts, retries, outage, dead-letter, crash recovery |
+
+Tunables (environment variables): `DELIVERY_CONCURRENCY` (16), `FINGERPRINT_WORKERS` (cpu−1, max 4),
+`DELIVERY_MAX_ATTEMPTS` (15), `DELIVERY_BACKOFF_BASE` (0.25 s), `DELIVERY_BACKOFF_CAP` (30 s),
+`DELIVERY_LEASE_SECONDS` (60 s), `SWEEP_INTERVAL` (0.2 s).
+
+> The schema changed. If you have a `webhooks.db` left over from the original code, delete it before starting the service.
